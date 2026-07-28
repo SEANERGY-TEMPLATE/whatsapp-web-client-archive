@@ -1,0 +1,98 @@
+#!/usr/bin/env node
+
+// Walks the archive in version order and reports how much the client changed
+// between each consecutive pair. Run with --json for machine-readable output.
+
+const fs = require('fs');
+const path = require('path');
+
+const { fingerprint, compare, risk, compareVersions } = require('./fingerprint');
+
+const outDir = __dirname;
+const DIVERGENCE_THRESHOLD = 0.7;
+const asJson = process.argv.includes('--json');
+const verbose = process.argv.includes('--verbose');
+
+const versions = fs
+    .readdirSync(outDir)
+    .filter((name) => name.endsWith('.html'))
+    .map((name) => name.slice(0, -'.html'.length))
+    .filter((v) => /^\d+(?:\.\d+){1,4}$/.test(v))
+    .sort(compareVersions);
+
+if (versions.length === 0) {
+    console.error('No archived versions found.');
+    process.exit(1);
+}
+
+const prints = new Map();
+for (const version of versions) {
+    const html = fs.readFileSync(path.join(outDir, `${version}.html`), 'utf-8');
+    prints.set(version, fingerprint(html));
+}
+
+const pct = (n) => `${(n * 100).toFixed(1)}%`;
+
+const rows = [];
+for (let i = 1; i < versions.length; i++) {
+    const older = versions[i - 1];
+    const newer = versions[i];
+    const result = compare(prints.get(older), prints.get(newer));
+    rows.push({
+        from: older,
+        to: newer,
+        bundleSimilarity: Number(result.bundleSimilarity.toFixed(4)),
+        bootloaderSimilarity: Number(result.bootloaderSimilarity.toFixed(4)),
+        added: result.added,
+        removed: result.removed,
+        byteDelta: result.byteDelta,
+        risk: risk(result),
+        diverged: result.bundleSimilarity < DIVERGENCE_THRESHOLD,
+    });
+}
+
+if (asJson) {
+    console.log(JSON.stringify({ versions, comparisons: rows }, null, 2));
+    process.exit(0);
+}
+
+console.log(`${versions.length} archived version(s):`);
+for (const version of versions) {
+    const fp = prints.get(version);
+    console.log(
+        `  ${version}  build ${fp.build ?? '?'}  ` +
+            `${fp.bundles.length} bundles  ${fp.bytes} bytes`,
+    );
+}
+
+if (rows.length === 0) {
+    console.log('\nOnly one version archived — nothing to compare yet.');
+    process.exit(0);
+}
+
+console.log('\nChange between consecutive versions:');
+for (const row of rows) {
+    const flag = row.diverged ? 'DIVERGED' : 'ok      ';
+    console.log(
+        `  ${flag}  ${row.from} -> ${row.to}  ` +
+            `bundles ${pct(row.bundleSimilarity)} similar ` +
+            `(+${row.added.length}, -${row.removed.length})  ` +
+            `bootloaders ${pct(row.bootloaderSimilarity)}  ` +
+            `risk ${row.risk}`,
+    );
+    if (verbose) {
+        for (const b of row.removed) console.log(`      - ${b}`);
+        for (const b of row.added) console.log(`      + ${b}`);
+    }
+}
+
+const diverged = rows.filter((r) => r.diverged);
+if (diverged.length) {
+    console.log(
+        `\n${diverged.length} transition(s) changed 30% or more of the client. ` +
+            'Re-run the whatsapp-web.js test suite before pinning those builds.',
+    );
+    process.exit(1);
+}
+
+console.log('\nNo transition changed 30% or more of the client.');

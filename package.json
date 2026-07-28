@@ -1,0 +1,12 @@
+{
+    "name": "whatsapp-web-client-archive",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Scheduled archive of WhatsApp Web index.html, one file per version, consumable as a whatsapp-web.js LocalWebCache path.",
+    "scripts": {
+        "archive": "./archive-version"
+    },
+    "dependencies": {
+        "puppeteer": "^24.31.0"
+    }
+}

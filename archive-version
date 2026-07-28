@@ -1,0 +1,370 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const path = require('path');
+const puppeteer = require('puppeteer');
+
+const {
+    fingerprint,
+    compare,
+    risk,
+    compareVersions,
+} = require('./fingerprint');
+
+const WhatsWebURL = 'https://web.whatsapp.com/';
+const outDir = __dirname;
+const jsonlPath = path.join(outDir, 'archive-log.jsonl');
+
+const NAV_TIMEOUT_MS = 90_000;
+const BOOT_TIMEOUT_MS = 120_000;
+const RUN_TIMEOUT_MS = 900_000;
+const ATTEMPTS = 3;
+const RETRY_BASE_MS = 15_000;
+
+// A new build sharing less than this fraction of the previous build's bundles
+// gets flagged. 0.70 means "30% or more of the client changed".
+const DIVERGENCE_THRESHOLD = 0.7;
+
+// A healthy index.html is ~575 KB with many bundle references. WhatsApp's error
+// page is ~6 KB, titled "Error", and references no bundles at all — so size,
+// title and bundle count together separate a real page from a served error or a
+// truncated body. Without this gate a 200-with-garbage response would be saved
+// under a valid version number, and the skip-if-exists check below would then
+// make that bad file permanent.
+const MIN_HTML_BYTES = 100_000;
+const MIN_BUNDLE_REFS = 5;
+
+// Guards against a hostile or malformed VERSION_STR escaping outDir once it is
+// interpolated into a filename. whatsapp-web.js has the same sanitizer in
+// LocalWebCache.persist, but left it commented out.
+const VERSION_RE = /^\d+(?:\.\d+){1,4}$/;
+
+// Human-readable lines use local time so they line up with archive.sh's
+// headers; the JSONL keeps UTC ISO timestamps for machine consumption.
+const stamp = () => new Date().toLocaleString('sv-SE');
+const log = (msg) => console.log(`${stamp()} ${msg}`);
+const warn = (msg) => console.error(`${stamp()} WARN ${msg}`);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Never let bookkeeping failures mask the real outcome.
+const record = (entry) => {
+    try {
+        fs.appendFileSync(
+            jsonlPath,
+            `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`,
+        );
+    } catch (err) {
+        warn(`could not append to archive-log.jsonl: ${err.message}`);
+    }
+};
+
+const validate = (html) => {
+    const problems = [];
+    if (html.length < MIN_HTML_BYTES) {
+        problems.push(
+            `body too small: ${html.length} bytes < ${MIN_HTML_BYTES}`,
+        );
+    }
+    if (!/<title>\s*WhatsApp[^<]*<\/title>/i.test(html)) {
+        const found = html.match(/<title>([^<]*)<\/title>/i);
+        problems.push(
+            `unexpected <title>: ${found ? JSON.stringify(found[1]) : 'none'}`,
+        );
+    }
+    const bundleRefs = (html.match(/rsrc\.php/g) || []).length;
+    if (bundleRefs < MIN_BUNDLE_REFS) {
+        problems.push(`only ${bundleRefs} bundle refs < ${MIN_BUNDLE_REFS}`);
+    }
+    return problems;
+};
+
+// Compares origin and path only. WhatsApp is a single-page app and will land on
+// URLs like "https://web.whatsapp.com/#", so comparing raw strings would reject
+// a perfectly good load as an unexpected redirect. Fragments never reach the
+// server and the query string does not change which document we got.
+const sameUrl = (a, b) => {
+    const norm = (u) => {
+        const { origin, pathname } = new URL(u);
+        return `${origin}${pathname.replace(/\/+$/, '')}`;
+    };
+    try {
+        return norm(a) === norm(b);
+    } catch {
+        return false;
+    }
+};
+
+// Mirrors tools/version-checker/update-version in whatsapp-web.js. The user
+// agent is taken from the running browser instead of being hardcoded there, so
+// it never goes stale enough for WhatsApp to serve an unsupported-browser page.
+const launchArgs = [
+    '--autoplay-policy=user-gesture-required',
+    '--disable-background-networking',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-breakpad',
+    '--disable-client-side-phishing-detection',
+    '--disable-component-update',
+    '--disable-default-apps',
+    '--disable-dev-shm-usage',
+    '--disable-domain-reliability',
+    '--disable-extensions',
+    '--disable-features=AudioServiceOutOfProcess',
+    '--disable-hang-monitor',
+    '--disable-ipc-flooding-protection',
+    '--disable-notifications',
+    '--disable-offer-store-unmasked-wallet-cards',
+    '--disable-popup-blocking',
+    '--disable-print-preview',
+    '--disable-prompt-on-repost',
+    '--disable-renderer-backgrounding',
+    '--disable-speech-api',
+    '--disable-sync',
+    '--disable-gpu',
+    '--disable-accelerated-2d-canvas',
+    '--hide-scrollbars',
+    '--ignore-gpu-blacklist',
+    '--metrics-recording-only',
+    '--mute-audio',
+    '--no-default-browser-check',
+    '--no-first-run',
+    '--no-pings',
+    '--no-zygote',
+    '--password-store=basic',
+    '--use-gl=swiftshader',
+    '--use-mock-keychain',
+    '--disable-setuid-sandbox',
+    '--no-sandbox',
+    '--disable-blink-features=AutomationControlled',
+];
+
+const fetchLatest = async () => {
+    const browser = await puppeteer.launch({ args: launchArgs });
+
+    try {
+        const page = await browser.newPage();
+        await page.setUserAgent(
+            (await browser.userAgent()).replace('HeadlessChrome', 'Chrome'),
+        );
+
+        // Start reading the body while the response is still live; await later.
+        let bodyPromise = null;
+        let status = null;
+        page.on('response', (res) => {
+            if (!sameUrl(res.url(), WhatsWebURL)) return;
+            if (status === null) status = res.status();
+            if (!bodyPromise && res.ok()) bodyPromise = res.text();
+        });
+
+        const navResponse = await page.goto(WhatsWebURL, {
+            waitUntil: 'load',
+            timeout: NAV_TIMEOUT_MS,
+            referer: 'https://whatsapp.com/',
+        });
+
+        const httpStatus = navResponse ? navResponse.status() : status;
+        const finalUrl = navResponse ? navResponse.url() : null;
+        log(`HTTP ${httpStatus} ${finalUrl}`);
+
+        // Checked explicitly so a served error page reports its status instead
+        // of surfacing as a confusing waitForFunction timeout two minutes later.
+        if (navResponse && !navResponse.ok()) {
+            throw new Error(`WhatsApp returned HTTP ${httpStatus}`);
+        }
+        if (finalUrl && !sameUrl(finalUrl, WhatsWebURL)) {
+            throw new Error(`unexpected redirect to ${finalUrl}`);
+        }
+
+        // A bare puppeteer TimeoutError here would only say "Waiting failed",
+        // which tells whoever reads the log nothing about the cause. The page
+        // title distinguishes a served error page from a client that loaded but
+        // whose module registry moved.
+        try {
+            await page.waitForFunction(
+                () => window.require && window.require('WAWebBuildConstants'),
+                { timeout: BOOT_TIMEOUT_MS },
+            );
+        } catch {
+            const title = await page.title().catch(() => '(unavailable)');
+            const hasRequire = await page
+                .evaluate(() => typeof window.require === 'function')
+                .catch(() => false);
+            throw new Error(
+                `WAWebBuildConstants unavailable after ${BOOT_TIMEOUT_MS}ms — ` +
+                    `HTTP ${httpStatus}, page title ${JSON.stringify(title)}, ` +
+                    `window.require ${hasRequire ? 'present' : 'absent'}`,
+            );
+        }
+
+        const version = await page.evaluate(
+            () => window.require('WAWebBuildConstants').VERSION_STR,
+        );
+
+        const indexHtml = bodyPromise
+            ? await bodyPromise
+            : await navResponse.text();
+
+        if (!version || !VERSION_RE.test(version)) {
+            throw new Error(`implausible version string: ${JSON.stringify(version)}`);
+        }
+        if (!indexHtml) throw new Error('captured an empty index.html body');
+
+        const problems = validate(indexHtml);
+        if (problems.length) {
+            throw new Error(`response failed validation — ${problems.join('; ')}`);
+        }
+
+        return { version, indexHtml, httpStatus };
+    } finally {
+        await browser.close().catch((err) =>
+            warn(`browser close failed: ${err.message}`),
+        );
+    }
+};
+
+const fetchWithRetry = async () => {
+    let lastErr;
+
+    for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+        try {
+            const result = await fetchLatest();
+            return { ...result, attempts: attempt };
+        } catch (err) {
+            lastErr = err;
+            warn(`attempt ${attempt}/${ATTEMPTS} failed: ${err.message}`);
+            if (attempt < ATTEMPTS) {
+                const wait = RETRY_BASE_MS * attempt;
+                log(`retrying in ${wait / 1000}s`);
+                await sleep(wait);
+            }
+        }
+    }
+
+    lastErr.attempts = ATTEMPTS;
+    throw lastErr;
+};
+
+const writeAtomic = (filePath, contents) => {
+    const tmpPath = `${filePath}.tmp`;
+    fs.writeFileSync(tmpPath, contents);
+    fs.renameSync(tmpPath, filePath);
+};
+
+const archivedVersions = () =>
+    fs
+        .readdirSync(outDir)
+        .filter((name) => name.endsWith('.html'))
+        .map((name) => name.slice(0, -'.html'.length))
+        .filter((v) => VERSION_RE.test(v))
+        .sort(compareVersions);
+
+// Compares a freshly fetched build against the newest one already on disk and
+// says how much of the client actually changed. Bundle URLs are content
+// addressed, so this measures shipped-code churn rather than response noise.
+const compareWithPrevious = (version, indexHtml) => {
+    const previous = archivedVersions()
+        .filter((v) => v !== version)
+        .pop();
+
+    if (!previous) {
+        log('no earlier version archived — nothing to compare against');
+        return null;
+    }
+
+    let previousHtml;
+    try {
+        previousHtml = fs.readFileSync(path.join(outDir, `${previous}.html`), 'utf-8');
+    } catch (err) {
+        warn(`could not read ${previous}.html for comparison: ${err.message}`);
+        return null;
+    }
+
+    const result = compare(fingerprint(previousHtml), fingerprint(indexHtml));
+    const similarity = result.bundleSimilarity;
+    const level = risk(result);
+    const detail =
+        `bundle similarity ${(similarity * 100).toFixed(1)}% ` +
+        `(+${result.added.length}, -${result.removed.length}), ` +
+        `bootloader similarity ${(result.bootloaderSimilarity * 100).toFixed(1)}%, ` +
+        `size ${result.byteDelta >= 0 ? '+' : ''}${result.byteDelta} bytes`;
+
+    if (similarity < DIVERGENCE_THRESHOLD) {
+        warn(
+            `DIVERGENCE ${version} differs from ${previous} by ` +
+                `${((1 - similarity) * 100).toFixed(1)}% — ${detail}; risk ${level}. ` +
+                'Test whatsapp-web.js against this build before pinning it.',
+        );
+    } else {
+        log(`compared with ${previous}: ${detail}; risk ${level}`);
+    }
+
+    return {
+        comparedWith: previous,
+        bundleSimilarity: Number(similarity.toFixed(4)),
+        bootloaderSimilarity: Number(result.bootloaderSimilarity.toFixed(4)),
+        bundlesAdded: result.added.length,
+        bundlesRemoved: result.removed.length,
+        byteDelta: result.byteDelta,
+        risk: level,
+        diverged: similarity < DIVERGENCE_THRESHOLD,
+    };
+};
+
+const main = async () => {
+    const { version, indexHtml, httpStatus, attempts } = await fetchWithRetry();
+    const filePath = path.join(outDir, `${version}.html`);
+    log(`live version ${version} (${indexHtml.length} bytes, ${attempts} attempt(s))`);
+
+    if (fs.existsSync(filePath)) {
+        // Re-check what is on disk. A run killed mid-write, or anything archived
+        // before this validation existed, would otherwise be skipped forever.
+        const existing = fs.readFileSync(filePath, 'utf-8');
+        const problems = validate(existing);
+
+        if (!problems.length) {
+            log(`already archived: ${version}.html — nothing to do`);
+            record({ ok: true, action: 'skipped', version, bytes: existing.length, httpStatus, attempts });
+            return;
+        }
+
+        warn(`existing ${version}.html is corrupt (${problems.join('; ')}) — replacing`);
+        writeAtomic(filePath, indexHtml);
+        log(`replaced: ${version}.html`);
+        record({ ok: true, action: 'replaced', version, bytes: indexHtml.length, httpStatus, attempts });
+        return;
+    }
+
+    // Compared before writing, so the new file is not its own nearest neighbour.
+    const comparison = compareWithPrevious(version, indexHtml);
+
+    writeAtomic(filePath, indexHtml);
+    writeAtomic(path.join(outDir, '.version'), `${version}\n`);
+    log(`archived: ${version}.html`);
+    record({
+        ok: true,
+        action: 'archived',
+        version,
+        bytes: indexHtml.length,
+        httpStatus,
+        attempts,
+        ...(comparison ?? {}),
+    });
+};
+
+// Last-resort watchdog. goto and waitForFunction have their own timeouts, but a
+// wedged browser process could still hang the run indefinitely, and cron would
+// never notice.
+const watchdog = setTimeout(() => {
+    console.error(`${stamp()} FATAL exceeded ${RUN_TIMEOUT_MS / 1000}s — forcing exit`);
+    record({ ok: false, action: 'timeout', error: `run exceeded ${RUN_TIMEOUT_MS}ms` });
+    process.exit(2);
+}, RUN_TIMEOUT_MS);
+watchdog.unref();
+
+main()
+    .then(() => clearTimeout(watchdog))
+    .catch((err) => {
+        console.error(`${stamp()} FAILED ${err.stack || err.message}`);
+        record({ ok: false, action: 'failed', error: err.message, attempts: err.attempts ?? null });
+        process.exit(1);
+    });
