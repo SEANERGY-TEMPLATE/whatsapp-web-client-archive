@@ -65,7 +65,7 @@ Risk is a rough read on that number, not a guarantee: `identical`, `low` at 80%+
 `moderate` at 50–80%, `high` below 50%. A build that replaced most of its bundles
 is likelier to have moved the internals whatsapp-web.js reaches into.
 
-Scheduled runs happen Monday and Thursday at 12:00 UTC (21:00 KST) via
+Scheduled runs happen every two days at 12:00 UTC (21:00 KST) via
 `.github/workflows/archive.yml`, which commits new versions back to this repo.
 
 ## Failure handling
@@ -97,7 +97,7 @@ output goes to `archive.log`, rotated at 1 MB.
 
 Note that cron does not catch up missed runs, so a run skipped while the machine
 was off is simply lost. Because versions are the dedupe key and WhatsApp ships
-slower than twice a week, the next run usually still captures it.
+slower than every two days, the next run usually still captures it.
 
 ## Consuming an archived version
 

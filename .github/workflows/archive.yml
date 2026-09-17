@@ -2,8 +2,8 @@ name: Archive
 
 on:
     schedule:
-        # Monday and Thursday, 12:00 UTC (21:00 KST)
-        - cron: '0 12 * * 1,4'
+        # Every 2 days, 12:00 UTC (21:00 KST)
+        - cron: '0 12 */2 * *'
     workflow_dispatch:
 
 permissions:
