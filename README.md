@@ -65,7 +65,7 @@ Risk is a rough read on that number, not a guarantee: `identical`, `low` at 80%+
 `moderate` at 50–80%, `high` below 50%. A build that replaced most of its bundles
 is likelier to have moved the internals whatsapp-web.js reaches into.
 
-Scheduled runs happen every two days at 12:00 UTC (21:00 KST) via
+Scheduled runs happen every two days at 10:47 UTC (19:47 KST) via
 `.github/workflows/archive.yml`, which commits new versions back to this repo.
 
 ## Failure handling

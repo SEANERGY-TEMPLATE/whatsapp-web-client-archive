@@ -2,8 +2,9 @@ name: Archive
 
 on:
     schedule:
-        # Every 2 days, 12:00 UTC (21:00 KST)
-        - cron: '0 12 */2 * *'
+        # Every 2 days, 10:47 UTC (19:47 KST). Off the top of the hour on
+        # purpose: minute :00 is peak load, where GitHub delays/drops cron runs.
+        - cron: '47 10 */2 * *'
     workflow_dispatch:
 
 permissions:
